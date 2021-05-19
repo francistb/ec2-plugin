@@ -23,6 +23,7 @@ import org.apache.http.auth.AuthSchemeProvider;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.config.AuthSchemes;
 import org.apache.http.client.config.RequestConfig;
@@ -36,6 +37,7 @@ import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.auth.BasicSchemeFactory;
 import org.apache.http.impl.client.BasicAuthCache;
 import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.protocol.BasicHttpContext;
@@ -184,7 +186,7 @@ public class WinRMClient {
         credsProvider.setCredentials(new AuthScope(AuthScope.ANY_HOST, AuthScope.ANY_PORT), new UsernamePasswordCredentials(username, password));
     }
 
-    private HttpClient buildHTTPClient() {
+    private CloseableHttpClient buildHTTPClient() {
         HttpClientBuilder builder = HttpClientBuilder.create().setDefaultCredentialsProvider(credsProvider);
         if(! (username.contains("\\")|| username.contains("/"))) {
             //user is not a domain user
@@ -245,7 +247,7 @@ public class WinRMClient {
             throw new RuntimeException("Too many retry for request");
         }
 
-        HttpClient httpclient = buildHTTPClient();
+        CloseableHttpClient httpclient = buildHTTPClient();
         HttpContext context = new BasicHttpContext();
 
         if (authCache.get() == null) {
@@ -262,54 +264,55 @@ public class WinRMClient {
 
             LOGGER.log(Level.FINEST, () -> "Request:\nPOST " + url + "\n" + request.asXML());
 
-            HttpResponse response = httpclient.execute(post, context);
-            HttpEntity responseEntity = response.getEntity();
+            try (CloseableHttpResponse response = httpclient.execute(post, context)) {
+                HttpEntity responseEntity = response.getEntity();
 
-            if (response.getStatusLine().getStatusCode() != 200) {
-                // check for possible timeout
-
-                if (response.getStatusLine().getStatusCode() == 500
-                        && (responseEntity.getContentType() != null && entity.getContentType().getValue().startsWith(APPLICATION_SOAP_XML))) {
-                    String respStr = EntityUtils.toString(responseEntity);
-                    if (respStr.contains("TimedOut")) {
-                        return DocumentHelper.parseText(respStr);
-                    }
-                } else {
-                    // this shouldn't happen, as httpclient knows how to auth
-                    // the request
-                    // but I've seen it. I blame keep-alive, so we're just going
-                    // to scrap the connections, and try again
-                    if (response.getStatusLine().getStatusCode() == 401) {
-                        // we need to force using new connections here
-                        // throw away our auth cache
-                        LOGGER.log(Level.WARNING, "winrm returned 401 - shouldn't happen though - retrying in 2 minutes");
-                        try {
-                            Thread.sleep(TimeUnit.MINUTES.toMillis(2));
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                        authCache.set(new BasicAuthCache());
-                        LOGGER.log(Level.WARNING, "winrm returned 401 - retrying now");
-                        return sendRequest(request, ++retry);
-                    }
-                    LOGGER.log(Level.WARNING, "winrm service " + shellId + " unexpected HTTP Response ("
-                            + response.getStatusLine().getReasonPhrase() + "): "
-                            + EntityUtils.toString(response.getEntity()));
-
-                    throw new RuntimeException("Unexpected HTTP response " + response.getStatusLine().getStatusCode()
-                            + " on " + url + ": " + response.getStatusLine().getReasonPhrase());
-                }
+	            if (response.getStatusLine().getStatusCode() != 200) {
+	                // check for possible timeout
+	
+	                if (response.getStatusLine().getStatusCode() == 500
+	                        && (responseEntity.getContentType() != null && entity.getContentType().getValue().startsWith(APPLICATION_SOAP_XML))) {
+	                    String respStr = EntityUtils.toString(responseEntity);
+	                    if (respStr.contains("TimedOut")) {
+	                        return DocumentHelper.parseText(respStr);
+	                    }
+	                } else {
+	                    // this shouldn't happen, as httpclient knows how to auth
+	                    // the request
+	                    // but I've seen it. I blame keep-alive, so we're just going
+	                    // to scrap the connections, and try again
+	                    if (response.getStatusLine().getStatusCode() == 401) {
+	                        // we need to force using new connections here
+	                        // throw away our auth cache
+	                        LOGGER.log(Level.WARNING, "winrm returned 401 - shouldn't happen though - retrying in 2 minutes");
+	                        try {
+	                            Thread.sleep(TimeUnit.MINUTES.toMillis(2));
+	                        } catch (InterruptedException e) {
+	                            Thread.currentThread().interrupt();
+	                        }
+	                        authCache.set(new BasicAuthCache());
+	                        LOGGER.log(Level.WARNING, "winrm returned 401 - retrying now");
+	                        return sendRequest(request, ++retry);
+	                    }
+	                    LOGGER.log(Level.WARNING, "winrm service " + shellId + " unexpected HTTP Response ("
+	                            + response.getStatusLine().getReasonPhrase() + "): "
+	                            + EntityUtils.toString(response.getEntity()));
+	
+	                    throw new RuntimeException("Unexpected HTTP response " + response.getStatusLine().getStatusCode()
+	                            + " on " + url + ": " + response.getStatusLine().getReasonPhrase());
+	                }
+	            }
+	
+	            if (responseEntity.getContentType() == null
+	                    || !entity.getContentType().getValue().startsWith(APPLICATION_SOAP_XML)) {
+	                throw new RuntimeException("Unexpected WinRM content type: " + entity.getContentType());
+	            }
+	
+	            Document responseDocument = DocumentHelper.parseText(EntityUtils.toString(responseEntity));
+	
+	            LOGGER.log(Level.FINEST, () -> "Response:\n" + responseDocument.asXML());
+	            return responseDocument;
             }
-
-            if (responseEntity.getContentType() == null
-                    || !entity.getContentType().getValue().startsWith(APPLICATION_SOAP_XML)) {
-                throw new RuntimeException("Unexpected WinRM content type: " + entity.getContentType());
-            }
-
-            Document responseDocument = DocumentHelper.parseText(EntityUtils.toString(responseEntity));
-
-            LOGGER.log(Level.FINEST, () -> "Response:\n" + responseDocument.asXML());
-            return responseDocument;
         } catch (URISyntaxException e) {
             throw new RuntimeException("Invalid WinRM URI " + url);
         } catch (UnsupportedEncodingException e) {
